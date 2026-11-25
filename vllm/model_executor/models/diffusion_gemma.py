@@ -39,6 +39,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.config import DiffusionGemmaDiffusionOptions
 from vllm.model_executor.models.diffusion_gemma_sampler import (
+    FusedSoftcapSampler,
     sample_row_stats,
     sample_row_stats_reference,
     sample_step,
@@ -341,7 +342,9 @@ class DiffusionGemmaForConditionalGeneration(
             **kwargs,
         )
 
-    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+    def compute_logits(
+        self, hidden_states: torch.Tensor, softcap: bool = True
+    ) -> torch.Tensor | None:
         states = getattr(self, "diffusion_states", None)
         allowed = states.step_allowed if states is not None else None
         if allowed is not None:
@@ -352,7 +355,7 @@ class DiffusionGemmaForConditionalGeneration(
             ).float()
         else:
             logits = self.logits_processor(self.lm_head, hidden_states)
-        if logits is not None and self.final_logit_softcapping is not None:
+        if softcap and logits is not None and self.final_logit_softcapping is not None:
             cap = self.final_logit_softcapping
             if logits.is_cuda:
                 logits = softcap_logits(logits, cap)
@@ -795,6 +798,7 @@ class DiffusionGemmaModelState(ModelState):
             vocab_size=self.model_config.get_vocab_size(),
             diffusion_states=self.diffusion_states,
             compute_logits=self.model.compute_logits,
+            final_logit_softcapping=self.model.final_logit_softcapping,
             t_min=gen["t_min"],
             t_max=gen["t_max"],
             entropy_bound=entropy_bound,
@@ -1007,7 +1011,8 @@ class DiffusionSampler:
         vocab_size: int,
         diffusion_states: DiffusionGemmaRequestStates,
         *,
-        compute_logits: Callable[[torch.Tensor], torch.Tensor],
+        compute_logits: Callable[..., torch.Tensor],
+        final_logit_softcapping: float | None = None,
         confidence_threshold: float,
         t_min: float,
         t_max: float,
@@ -1044,6 +1049,9 @@ class DiffusionSampler:
         self.vocab_size = vocab_size
         self.diffusion_states = diffusion_states
         self.entropy_bound = entropy_bound
+        self.fused_sampler = FusedSoftcapSampler.create(
+            final_logit_softcapping, vocab_size, embed_weight, tp_size
+        )
 
         max_num_reqs = diffusion_states.max_num_reqs
         device = diffusion_states.device
@@ -1599,7 +1607,26 @@ class DiffusionSampler:
                     tile_hidden = hidden_states[src.reshape(-1)].masked_fill_(
                         phantom, 0
                     )
-                tile_logits = self.compute_logits(tile_hidden)
+                compute_sc = (
+                    not states.single_step_slots
+                    or not states.single_step_slots.issuperset(
+                        decode_slots_np[sel_np].tolist()
+                    )
+                )
+                lp_np = np.flatnonzero(lp_decode_np[sel_np])
+                wide_np = np.flatnonzero(wide_decode_np[sel_np])
+                # The fused kernel takes the raw logits and applies the softcap
+                # itself. Logprobs read the softcapped fp32 logits, and a
+                # filtered or constrained step changes them before sampling.
+                fused = (
+                    self.fused_sampler is not None
+                    and allowed is None
+                    and per_row is None
+                    and compute_sc
+                    and not len(lp_np)
+                    and not len(wide_np)
+                )
+                tile_logits = self.compute_logits(tile_hidden, softcap=not fused)
                 if allowed is not None:
                     assert tile_logits.shape[-1] == allowed.numel()
 
@@ -1613,6 +1640,13 @@ class DiffusionSampler:
                     decode_slots_np[sel_np],
                     tile_logits.shape[-1],
                 )
+                if fused and (
+                    top_k is not None
+                    or top_p is not None
+                    or not self.fused_sampler.supports(tile_logits)
+                ):
+                    fused = False
+                    tile_logits = softcap_logits(tile_logits, self.fused_sampler.cap)
                 if top_k is not None or top_p is not None:
                     tile_logits = apply_top_k_top_p(
                         tile_logits.float(),
@@ -1629,13 +1663,6 @@ class DiffusionSampler:
                         tile_valid_np,
                         [per_row[i] for i in sel_np],
                     )
-                compute_sc = (
-                    not states.single_step_slots
-                    or not states.single_step_slots.issuperset(
-                        decode_slots_np[sel_np].tolist()
-                    )
-                )
-
                 temp = _denoise_temperature(
                     states.step,
                     tile_slots,
@@ -1644,7 +1671,11 @@ class DiffusionSampler:
                     self.t_max,
                 )
                 probs_dtype = self.embed_weight.dtype if compute_sc else None
-                if tile_logits.is_cuda:
+                if fused:
+                    seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
+                    stats = self.fused_sampler(tile_logits, temp, seed)
+                    step_fn = sample_step
+                elif tile_logits.is_cuda:
                     seed = int(torch.randint(0, 2**31 - 1, (1,)).item())
                     stats = sample_row_stats(tile_logits, temp, W, seed, probs_dtype)
                     step_fn = sample_step
@@ -1660,8 +1691,6 @@ class DiffusionSampler:
                     argmax_rows = allowed[argmax_rows]
                     sample_rows = allowed[sample_rows]
                 probs = probs_rows.view(n, W, -1) if probs_rows is not None else None
-                lp_np = np.flatnonzero(lp_decode_np[sel_np])
-                wide_np = np.flatnonzero(wide_decode_np[sel_np])
                 if len(lp_np):
                     # Read-only slots report logprobs at temperature 1.
                     lp_temp = torch.where(states.read_only[tile_slots], 1.0, temp)

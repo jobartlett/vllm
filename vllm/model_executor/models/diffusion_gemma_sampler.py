@@ -22,6 +22,7 @@ converge.
 """
 
 import math
+import os
 from typing import Any, NamedTuple
 
 import torch
@@ -31,7 +32,10 @@ from vllm.model_executor.warmup.jit_warmup_triton_helper import (
     TritonWarmupTensor,
     triton_kernel_dispatcher_with_warmup,
 )
+from vllm.logger import init_logger
 from vllm.triton_utils import tl, tldevice, triton
+
+logger = init_logger(__name__)
 
 # Allowed-set sizes covering Triton's integer specializations (1, divisible by
 # 16, other) for constrained steps, which run the sampler over K columns.
@@ -674,6 +678,96 @@ def softcap_logits(logits: torch.Tensor, cap: float) -> DispatchSpec:
         ),
         out,
     )
+
+
+class FusedSoftcapSampler:
+    """FlashInfer's fused softcap + row statistics kernel (SM90 CuTe-DSL).
+
+    One pass over the raw BF16 `lm_head` logits in place of `softcap_logits`
+    followed by `sample_row_stats`. It covers unfiltered full-vocabulary rows
+    only, and draws its Gumbel noise from a different Philox stream than
+    `sample_row_stats`. Enabled with `VLLM_DIFFUSION_GEMMA_FUSED_SAMPLER=1`.
+    """
+
+    VOCAB = 262144
+    MAX_ROWS = 65535
+
+    def __init__(self, cap: float, run: Any, check_inputs: Any) -> None:
+        self.cap = cap
+        self._run = run
+        self._check_inputs = check_inputs
+
+    @classmethod
+    def create(
+        cls,
+        cap: float | None,
+        vocab_size: int,
+        embed_weight: torch.Tensor,
+        tp_size: int,
+    ) -> "FusedSoftcapSampler | None":
+        if os.environ.get("VLLM_DIFFUSION_GEMMA_FUSED_SAMPLER", "0") != "1":
+            return None
+        reason = None
+        if not embed_weight.is_cuda:
+            reason = "the model is not on a CUDA device"
+        elif torch.cuda.get_device_capability(embed_weight.device) != (9, 0):
+            reason = "the device is not SM90"
+        elif embed_weight.dtype != torch.bfloat16 or vocab_size != cls.VOCAB:
+            reason = f"it needs BF16 and a {cls.VOCAB}-token vocabulary"
+        elif cap is None or not 2.0**-16 <= cap <= 64.0:
+            reason = f"final_logit_softcapping={cap} is out of its range"
+        elif tp_size != 1:
+            reason = "it is wired for tensor-parallel size 1 only"
+        if reason is None:
+            try:
+                from flashinfer.experimental.softcap_sample_with_stats import (
+                    check_inputs,
+                    run,
+                )
+            except ImportError as e:
+                reason = f"this FlashInfer does not provide it ({e})"
+        if reason is not None:
+            logger.warning("DiffusionGemma fused sampler disabled: %s", reason)
+            return None
+        fused = cls(float(cap), run, check_inputs)
+        # Compile (or load from FlashInfer's CuTe-DSL cache) before serving.
+        device = embed_weight.device
+        fused(
+            torch.zeros(8, cls.VOCAB, dtype=torch.bfloat16, device=device),
+            torch.ones(1, dtype=torch.float32, device=device),
+            0,
+        )
+        logger.info("DiffusionGemma fused sampler enabled (FlashInfer CuTe-DSL)")
+        return fused
+
+    def supports(self, logits: torch.Tensor) -> bool:
+        return (
+            logits.dtype == torch.bfloat16
+            and logits.dim() == 2
+            and logits.shape[1] == self.VOCAB
+            and logits.shape[0] <= self.MAX_ROWS
+            and logits.is_contiguous()
+            and logits.data_ptr() % 16 == 0
+        )
+
+    def __call__(
+        self, logits: torch.Tensor, temps: torch.Tensor, seed: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """`sample_row_stats` of the softcapped `logits`, from the raw logits.
+
+        Row `i` uses temperature `temps[i // (rows // len(temps))]`.
+        """
+        rows = logits.shape[0]
+        temps = temps.to(torch.float32).contiguous()
+        out = (
+            _empty(logits, rows, dtype=torch.int64),
+            _empty(logits, rows, dtype=torch.int64),
+            _empty(logits, rows, dtype=torch.float32),
+            _empty(logits, rows, self.VOCAB, dtype=torch.bfloat16),
+        )
+        self._check_inputs(logits, temps, seed, self.cap, out)
+        self._run(logits, temps, seed, self.cap, *out)
+        return out
 
 
 # The stash kernels reproduce compute_topk_scores' values (tied top-k ids
