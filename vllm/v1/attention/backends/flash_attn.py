@@ -4,6 +4,7 @@
 
 import copy
 import functools
+import os
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -94,6 +95,54 @@ FA4_DENSE_NUM_BLOCKS = 256
 FA4_DENSE_MAX_SEQLEN_K = 8192
 # Two splits of 64 KV blocks admit SplitKV S ping-pong.
 FA4_DENSE_LONG_SEQLEN_K = 16384
+# SM90 head_dim 512 forward loads KV with TMA only when a page is one 64-token
+# tile; larger pages are presented to it as several pages of this many tokens.
+# VLLM_FA4_SM90_SPLIT_PAGE=0 passes the pages through unchanged.
+FA4_SM90_SPLIT_PAGE = int(os.environ.get("VLLM_FA4_SM90_SPLIT_PAGE", "64"))
+
+
+def _fa4_sm90_split_page(head_dim: int, block_size: int) -> int | None:
+    """Page size FA4 sees for an SM90 head_dim-512 layer, if it differs from block_size."""
+    capability = current_platform.get_device_capability()
+    if (
+        FA4_SM90_SPLIT_PAGE
+        and capability is not None
+        and capability.major == 9
+        and head_dim == 512
+        and block_size > FA4_SM90_SPLIT_PAGE
+        and block_size % FA4_SM90_SPLIT_PAGE == 0
+    ):
+        return FA4_SM90_SPLIT_PAGE
+    return None
+
+
+def _split_kv_pages(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    page: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """View (num_blocks, block_size, heads, dim) K/V caches as pages of `page` tokens.
+
+    Page j of block b starts j * page tokens into the block. Pages are addressed with
+    the token stride, so block b's pages are indices b * ratio + j, where ratio is the
+    block stride in units of one page; the head-major layout leaves gaps between blocks
+    that no table entry points to.
+    """
+    num_blocks, block_size = key_cache.shape[:2]
+    stride = key_cache.stride()
+    assert value_cache.stride() == stride
+    ratio, rem = divmod(stride[0], page * stride[1])
+    assert rem == 0 and block_size % page == 0
+    split = block_size // page
+    shape = ((num_blocks - 1) * ratio + split, page, *key_cache.shape[2:])
+    strides = (page * stride[1], *stride[1:])
+    offsets = torch.arange(split, dtype=block_table.dtype, device=block_table.device)
+    return (
+        key_cache.as_strided(shape, strides),
+        value_cache.as_strided(shape, strides),
+        (block_table.unsqueeze(-1) * ratio + offsets).flatten(1),
+    )
 
 
 class FA4DenseAttentionKernel(VllmJitKernel["FA4DenseAttentionKernel.CompileKey"]):
@@ -184,6 +233,7 @@ class FA4DenseAttentionKernel(VllmJitKernel["FA4DenseAttentionKernel.CompileKey"
             return []
         head_dim = kv_cache_spec.head_size
         page_size = kv_cache_spec.block_size
+        page_size = _fa4_sm90_split_page(head_dim, page_size) or page_size
         softcap = float(
             getattr(
                 vllm_config.model_config.hf_text_config, "attn_logit_softcapping", 0
@@ -1492,6 +1542,22 @@ class FlashAttentionImpl(AttentionImpl):
                     sliding_window_size is not None and sliding_window_size[1] >= 0
                 )
                 causal = not has_window
+
+            split_page = (
+                None
+                if is_quantized_kv_cache(self.kv_cache_dtype)
+                else _fa4_sm90_split_page(self.head_size, key_cache.shape[1])
+            )
+            if split_page is not None:
+                logger.info_once(
+                    "FA4 SM90 head_dim %d: presenting %d-token KV pages as %d-token pages",
+                    self.head_size,
+                    key_cache.shape[1],
+                    split_page,
+                )
+                key_cache, value_cache, block_table = _split_kv_pages(
+                    key_cache, value_cache, block_table, split_page
+                )
 
             _FA4_DENSE_ATTENTION_KERNEL(
                 q=query[:num_actual_tokens],
