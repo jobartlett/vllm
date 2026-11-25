@@ -686,7 +686,8 @@ class FusedSoftcapSampler:
     One pass over the raw BF16 `lm_head` logits in place of `softcap_logits`
     followed by `sample_row_stats`. It covers unfiltered full-vocabulary rows
     only, and draws its Gumbel noise from a different Philox stream than
-    `sample_row_stats`. Enabled with `VLLM_DIFFUSION_GEMMA_FUSED_SAMPLER=1`.
+    `sample_row_stats`. `VLLM_DIFFUSION_GEMMA_FUSED_SAMPLER=0` turns it off; a
+    FlashInfer without the kernel falls back to the Triton path with a warning.
     """
 
     VOCAB = 262144
@@ -705,7 +706,7 @@ class FusedSoftcapSampler:
         embed_weight: torch.Tensor,
         tp_size: int,
     ) -> "FusedSoftcapSampler | None":
-        if os.environ.get("VLLM_DIFFUSION_GEMMA_FUSED_SAMPLER", "0") != "1":
+        if os.environ.get("VLLM_DIFFUSION_GEMMA_FUSED_SAMPLER", "1") != "1":
             return None
         reason = None
         if not embed_weight.is_cuda:
